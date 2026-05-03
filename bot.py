@@ -30,7 +30,7 @@ intents.message_content = True
 
 # YTDL options
 ytdl_format_options = {
-    "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
+    "format": "bestaudio/best",
     "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
     "restrictfilenames": True,
     "noplaylist": True,
@@ -44,13 +44,26 @@ ytdl_format_options = {
     "socket_timeout": 30,
     "retries": 3,
     "fragment_retries": 3,
-    "extractor_retries": 3,
+    "extractor_retries": 3
+    # "cookiesfrombrowser": ('firefox', None, None, None)
 }
 
 ffmpeg_options = {
-    'before_options': '-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_at_eof 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -thread_queue_size 4096 -probesize 1M -analyzeduration 0 -fflags +nobuffer',
-    # Apply volume at the encoder to avoid PCM transformation and reduce CPU usage
-    'options': '-vn -b:a 128k -bufsize 1024k -maxrate 128k -filter:a volume=0.25 -loglevel error'
+    'before_options': (
+        '-nostdin '
+        '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 '
+        '-reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx '
+        '-rw_timeout 15000000 '
+        '-probesize 256k -analyzeduration 1M '
+        '-thread_queue_size 1024'
+    ),
+
+    'options': (
+        '-vn -sn -dn '
+        '-b:a 96k '
+        '-af volume=0.20,aresample=async=1:min_hard_comp=0.100:first_pts=0 '
+        '-loglevel warning'
+    )
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
@@ -66,7 +79,12 @@ class YTDLSource(discord.AudioSource):
         self.url = data.get("url")
         self.webpage_url = data.get("webpage_url")
         self.thumbnail = data.get("thumbnail")
-        self.duration = data.get("duration_string") or "Unknown"
+        duration = data.get("duration_string")
+        if not duration and data.get("duration"):
+            m, s = divmod(data.get("duration"), 60)
+            h, m = divmod(m, 60)
+            duration = f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
+        self.duration = duration or "Unknown"
 
     def read(self):
         return self._audio.read()
@@ -83,7 +101,7 @@ class YTDLSource(discord.AudioSource):
 
     @classmethod
     async def create_source(cls, query, *, loop=None, stream=True, retries=3):
-        loop = loop or asyncio.get_event_loop()
+        loop = loop or asyncio.get_running_loop()
         
         for attempt in range(retries):
             try:
@@ -122,7 +140,8 @@ class YTDLSource(discord.AudioSource):
 
 
 class Player:
-    def __init__(self, guild, loop):
+    def __init__(self, cog, guild, loop):
+        self.cog = cog
         self.guild = guild
         self.loop = loop
         self.voice_client = None
@@ -131,6 +150,7 @@ class Player:
         self.current: YTDLSource | None = None
         self.next_event = asyncio.Event()
         self.idle_counter = 0
+        self.text_channel: discord.abc.Messageable | None = None
         # Start timers and player task
         self.dc_timer.start()
         self.player_task = loop.create_task(self.player_loop())
@@ -171,7 +191,7 @@ class Player:
                 # Start playback
                 self.voice_client.play(self.current, after=_after_play)
 
-                # Announce now playing
+                # Announce now playing in the bound channel, or a sensible fallback
                 try:
                     embed = discord.Embed(
                         title="Now Playing",
@@ -180,10 +200,22 @@ class Player:
                     )
                     if self.current.thumbnail:
                         embed.set_thumbnail(url=self.current.thumbnail)
-                    coro = self.guild.text_channels[0].send(embed=embed)
-                    await coro
-                except Exception:
-                    pass
+
+                    target_channel = self.text_channel
+                    if target_channel is None:
+                        # Fallback: system channel or first channel with send permission
+                        target_channel = self.guild.system_channel
+                        if target_channel is None:
+                            me = self.guild.me
+                            for ch in self.guild.text_channels:
+                                perms = ch.permissions_for(me)
+                                if perms.send_messages:
+                                    target_channel = ch
+                                    break
+                    if target_channel is not None:
+                        await target_channel.send(embed=embed)
+                except Exception as e:
+                    logger.debug(f"Failed to send now playing embed: {e}")
 
                 # Wait until track finishes
                 await self.next_event.wait()
@@ -198,25 +230,38 @@ class Player:
         if self.voice_client:
             await self.voice_client.disconnect()
             self.voice_client = None
-            # Drain queue and cleanup current
-            while not self.queue.empty():
-                try:
-                    src = self.queue.get_nowait()
-                    if hasattr(src, 'cleanup'):
-                        src.cleanup()
-                except Exception:
-                    pass
-            if self.current and hasattr(self.current, 'cleanup'):
-                try:
-                    self.current.cleanup()
-                except Exception:
-                    pass
-            self.idle_counter = 0
-            logger.info(f"Disconnected from {self.guild.name}")
+
+        # Drain queue and cleanup current
+        while not self.queue.empty():
+            try:
+                src = self.queue.get_nowait()
+                if hasattr(src, 'cleanup'):
+                    src.cleanup()
+            except Exception:
+                pass
+        self.queue_list.clear()
+
+        if self.current and hasattr(self.current, 'cleanup'):
+            try:
+                self.current.cleanup()
+            except Exception:
+                pass
+
+        self.idle_counter = 0
+        self.dc_timer.cancel()
+        self.player_task.cancel()
+
+        if self.guild.id in self.cog.players:
+            del self.cog.players[self.guild.id]
+
+        logger.info(f"Disconnected from {self.guild.name} and cleaned up player.")
 
     async def play_song(self, interaction, query):
         # Defer the response since song fetching might take time
         await interaction.response.defer()
+        
+        # Bind player announcements to the invoking channel
+        self.text_channel = interaction.channel
         
         if not await self.ensure_voice(interaction):
             return
@@ -250,6 +295,10 @@ class Player:
                 except asyncio.TimeoutError:
                     await interaction.edit_original_response(content="Failed to connect to the voice channel.")
                     return False
+                except Exception as e:
+                    logger.error(f"Error connecting to voice: {e}")
+                    await interaction.edit_original_response(content="An error occurred while connecting to the voice channel.")
+                    return False
             elif self.voice_client.channel != interaction.user.voice.channel:
                 await self.voice_client.move_to(interaction.user.voice.channel)
         else:
@@ -262,10 +311,13 @@ class Player:
             await interaction.response.send_message("The queue is currently empty.")
             return
 
-        description = "".join([
-            f"{idx + 1}. [{song.title}]({song.webpage_url})\n"
-            for idx, song in enumerate(self.queue_list)
-        ])
+        description = ""
+        for idx, song in enumerate(self.queue_list):
+            line = f"{idx + 1}. [{song.title}]({song.webpage_url})\n"
+            if len(description) + len(line) > 4000:
+                description += f"... and {len(self.queue_list) - idx} more."
+                break
+            description += line
 
         embed = discord.Embed(
             title="Queue",
@@ -293,7 +345,10 @@ class MusicCog(commands.Cog):
     async def play(self, interaction: discord.Interaction, song: str):
         """Play a song from YouTube."""
         logger.info(f"Received play command for song: {song} in guild {interaction.guild.name} by user {interaction.user.name}")
-        player = self.players.setdefault(interaction.guild.id, Player(interaction.guild, self.bot.loop))
+        player = self.players.get(interaction.guild.id)
+        if not player:
+            player = Player(self, interaction.guild, self.bot.loop)
+            self.players[interaction.guild.id] = player
         await player.play_song(interaction, song)
 
     @discord.app_commands.command(name="skip", description="Skip the currently playing song")
